@@ -43,6 +43,8 @@
 #include <syslog.h>
 #include <time.h>
 #include <getopt.h>
+#include <dirent.h>
+
 #include <sys/stat.h>
 #include <sys/timerfd.h>
 #include <sys/inotify.h>
@@ -65,6 +67,7 @@ static char *paths[MAX_PATHS];
 static size_t path_count = 0;
 static unsigned int interval = 60;
 static volatile sig_atomic_t running = 1;
+static int initial_cleanup = 0;
 static int foreground = 0;
 
 typedef struct watch_t {
@@ -92,6 +95,93 @@ static void handle_signal(int sig)
 {
     (void)sig;
     running = 0;
+}
+
+/* Recursively remove everything inside a directory. */
+static int clean_directory(int dirfd)
+{
+    int scanfd = dup(dirfd);
+    if (scanfd < 0)
+        return -1;
+
+    DIR *dir = fdopendir(scanfd);
+    if (!dir) {
+        close(scanfd);
+        return -1;
+    }
+
+    int errors = 0;
+    struct dirent *entry;
+
+    while ((entry = readdir(dir)) != NULL) {
+        if (!strcmp(entry->d_name, ".") ||
+            !strcmp(entry->d_name, ".."))
+            continue;
+
+        struct stat st;
+
+        if (fstatat(dirfd, entry->d_name, &st,
+                    AT_SYMLINK_NOFOLLOW) < 0) {
+            syslog(LOG_WARNING, "Cannot inspect %s: %s",
+                   entry->d_name, strerror(errno));
+            errors = 1;
+            continue;
+        }
+
+        if (S_ISDIR(st.st_mode)) {
+            int childfd = openat(dirfd, entry->d_name,
+                                 O_RDONLY | O_DIRECTORY |
+                                 O_NOFOLLOW | O_CLOEXEC);
+
+            if (childfd < 0) {
+                syslog(LOG_WARNING, "Cannot open directory %s: %s",
+                       entry->d_name, strerror(errno));
+                errors = 1;
+                continue;
+            }
+
+            if (clean_directory(childfd) < 0)
+                errors = 1;
+
+            close(childfd);
+
+            if (unlinkat(dirfd, entry->d_name, AT_REMOVEDIR) < 0) {
+                syslog(LOG_WARNING, "Cannot remove directory %s: %s",
+                       entry->d_name, strerror(errno));
+                errors = 1;
+            }
+        } else {
+            if (unlinkat(dirfd, entry->d_name, 0) < 0) {
+                syslog(LOG_WARNING, "Cannot remove %s: %s",
+                       entry->d_name, strerror(errno));
+                errors = 1;
+            }
+        }
+    }
+
+    closedir(dir);
+    return errors ? -1 : 0;
+}
+
+/* Clean one target directory. */
+static void clean_path(const char *path)
+{
+    int fd = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+
+    if (fd < 0) {
+        syslog(LOG_ERR, "Cannot open %s: %s",
+               path, strerror(errno));
+        return;
+    }
+
+    syslog(LOG_INFO, "Cleaning started: %s", path);
+
+    if (clean_directory(fd) == 0)
+        syslog(LOG_INFO, "Cleaning completed: %s", path);
+    else
+        syslog(LOG_WARNING, "Cleaning completed with errors: %s", path);
+
+    close(fd);
 }
 
 /* Find a watched directory using its watch descriptor. */
@@ -435,6 +525,7 @@ static void usage(const char *program)
         "  -t SEC     File deletion time in seconds\n"
         "  -f         Run in foreground\n"
         "  -h         Show this help\n"
+        "  -c         Initial cleanup\n"
         "  -v         Version\n",
         program);
 }
@@ -444,7 +535,7 @@ int main(int argc, char **argv)
     int opt;
     int ifd = -1, tfd = -1, epfd = -1;
 
-    while ((opt = getopt(argc, argv, "p:t:fhv")) != -1) {
+    while ((opt = getopt(argc, argv, "p:t:fchv")) != -1) {
         switch (opt) {
         case 'p':
             if (path_count >= MAX_PATHS) {
@@ -489,6 +580,10 @@ int main(int argc, char **argv)
             printf("%s\n", version);
             return EXIT_SUCCESS;
 
+        case 'c':
+            initial_cleanup = 1;
+            break;
+
         default:
             usage(argv[0]);
             return EXIT_FAILURE;
@@ -524,6 +619,11 @@ int main(int argc, char **argv)
            "%s started. Paths: %zu, interval: %u seconds",
            APP_NAME, path_count, interval);
 
+    /* Clean existing contents of all configured directories. */
+    if (initial_cleanup) {
+        for (size_t i = 0; i < path_count && running; i++)
+            clean_path(paths[i]);
+    }
 
     /* Initialize inotify. */
     ifd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
